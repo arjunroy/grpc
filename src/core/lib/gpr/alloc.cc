@@ -34,8 +34,43 @@ static void* zalloc_with_gpr_malloc(size_t sz) {
   return p;
 }
 
-static gpr_allocation_functions g_alloc_functions = {malloc, zalloc_with_calloc,
-                                                     realloc, free};
+static constexpr bool is_power_of_two(size_t value) {
+  // 2^N =     100000...000
+  // 2^N - 1 = 011111...111
+  // (2^N) && ((2^N)-1)) = 0
+  return (value & (value - 1)) == 0;
+}
+
+static void* aligned_alloc_with_gpr_malloc(size_t size, size_t alignment) {
+  GPR_DEBUG_ASSERT(is_power_of_two(alignment));
+  size_t extra = alignment - 1 + sizeof(void*);
+  void* p = gpr_malloc(size + extra);
+  void** ret = (void**)(((uintptr_t)p + extra) & ~(alignment - 1));
+  ret[-1] = p;
+  return (void*)ret;
+}
+
+static void* cacheline_alloc_with_gpr_malloc(size_t size) {
+  static_assert(is_power_of_two(GPR_CACHELINE_SIZE),
+                "GPR_CACHELINE_SIZE not power of two.");
+  size_t extra = GPR_CACHELINE_SIZE - 1 + sizeof(void*);
+  void* p = gpr_malloc(size + extra);
+  void** ret = (void**)(((uintptr_t)p + extra) & ~(GPR_CACHELINE_SIZE - 1));
+  ret[-1] = p;
+  return (void*)ret;
+}
+
+static void aligned_free_with_gpr_malloc(void* ptr) {
+  gpr_free((static_cast<void**>(ptr))[-1]);
+}
+
+static gpr_allocation_functions g_alloc_functions = {malloc,
+                                                     zalloc_with_calloc,
+                                                     realloc,
+                                                     free,
+                                                     gpr_malloc_aligned,
+                                                     gpr_malloc_cacheline,
+                                                     gpr_free_aligned};
 
 gpr_allocation_functions gpr_get_allocation_functions() {
   return g_alloc_functions;
@@ -47,6 +82,15 @@ void gpr_set_allocation_functions(gpr_allocation_functions functions) {
   GPR_ASSERT(functions.free_fn != nullptr);
   if (functions.zalloc_fn == nullptr) {
     functions.zalloc_fn = zalloc_with_gpr_malloc;
+  }
+  GPR_ASSERT((functions.aligned_alloc_fn == nullptr) ==
+             (functions.aligned_free_fn == nullptr));
+  GPR_ASSERT((functions.cacheline_alloc_fn == nullptr) ==
+             (functions.aligned_free_fn == nullptr));
+  if (functions.aligned_alloc_fn == nullptr) {
+    functions.aligned_alloc_fn = aligned_alloc_with_gpr_malloc;
+    functions.cacheline_alloc_fn = cacheline_alloc_with_gpr_malloc;
+    functions.aligned_free_fn = aligned_free_with_gpr_malloc;
   }
   g_alloc_functions = functions;
 }
@@ -89,27 +133,58 @@ void* gpr_realloc(void* p, size_t size) {
 }
 
 void* gpr_malloc_aligned(size_t size, size_t alignment) {
-#if defined(GPR_LINUX)
-  if (alignment == GPR_CACHELINE_SIZE) {
-    size = GPR_ROUND_UP_TO_CACHELINE_SIZE(size);
-  } else {
-    size = GPR_ROUND_UP_TO_ALIGNMENT_SIZE(size);
-  }
-  return aligned_alloc(alignment, size);
+#if defined(GPR_HAS_ALIGNED_ALLOC)
+  size = GPR_ROUND_UP_TO_SPECIFIED_SIZE(size, alignment);
+  void* ret = aligned_alloc(alignment, size);
+  GPR_ASSERT(ret != nullptr);
+  return ret;
+#elif defined(GPR_HAS_ALIGNED_MALLOC)
+  GPR_DEBUG_ASSERT(is_power_of_two(alignment));
+  void* ret = _aligned_malloc(size, alignment);
+  GPR_ASSERT(ret != nullptr);
+  return ret;
+#elif defined(GPR_HAS_POSIX_MEMALIGN)
+  GPR_DEBUG_ASSERT(is_power_of_two(alignment));
+  GPR_DEBUG_ASSERT(alignment % sizeof(void*) == 0);
+  void* ret = nullptr;
+  GPR_ASSERT(posix_memalign(&ret, alignment, size) == 0);
+  return ret;
 #else
-  GPR_DEBUG_ASSERT(((alignment - 1) & alignment) == 0);  // Must be power of 2.
-  size_t extra = alignment - 1 + sizeof(void*);
-  void* p = gpr_malloc(size + extra);
-  void** ret = (void**)(((uintptr_t)p + extra) & ~(alignment - 1));
-  ret[-1] = p;
-  return (void*)ret;
+  return aligned_alloc_with_gpr_malloc(size, alignment);
+#endif
+}
+
+void* gpr_malloc_cacheline(size_t size) {
+#if defined(GPR_HAS_ALIGNED_ALLOC)
+  size = GPR_ROUND_UP_TO_CACHELINE_SIZE(size);
+  void* ret = aligned_alloc(GPR_CACHELINE_SIZE, size);
+  GPR_ASSERT(ret != nullptr);
+  return ret;
+#elif defined(GPR_HAS_ALIGNED_MALLOC)
+  static_assert(is_power_of_two(GPR_CACHELINE_SIZE),
+                "GPR_CACHELINE_SIZE not power of two.");
+  void* ret = _aligned_malloc(size, GPR_CACHELINE_SIZE);
+  GPR_ASSERT(ret != nullptr);
+  return ret;
+#elif defined(GPR_HAS_POSIX_MEMALIGN)
+  static_assert(is_power_of_two(GPR_CACHELINE_SIZE),
+                "GPR_CACHELINE_SIZE not power of two.");
+  static_assert(GPR_CACHELINE_SIZE % sizeof(void*) == 0,
+                "GPR_CACHELINE_SIZE not evenly divisible by sizeof(void*).");
+  void* ret = nullptr;
+  GPR_ASSERT(posix_memalign(&ret, GPR_CACHELINE_SIZE, size) == 0);
+  return ret;
+#else
+  return cacheline_alloc_with_gpr_malloc(size);
 #endif
 }
 
 void gpr_free_aligned(void* ptr) {
-#if defined(GPR_LINUX)
+#if defined(GPR_HAS_ALIGNED_ALLOC) || defined(GPR_HAS_POSIX_MEMALIGN)
   free(ptr);
+#elif defined(GPR_HAS_ALIGNED_MALLOC)
+  _aligned_free(ptr);
 #else
-  gpr_free((static_cast<void**>(ptr))[-1]);
+  aligned_free_with_gpr_malloc(ptr);
 #endif
 }

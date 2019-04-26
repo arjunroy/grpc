@@ -33,34 +33,12 @@
 
 namespace grpc_core {
 
-template <size_t alignment>
-static void* _aligned_alloc(size_t size) {
-#if defined(GPR_LINUX)
-  if (alignment == GPR_CACHELINE_SIZE) {
-    size = GPR_ROUND_UP_TO_CACHELINE_SIZE(size);
-  } else {
-    size = GPR_ROUND_UP_TO_ALIGNMENT_SIZE(size);
-  }
-  return aligned_alloc(alignment, size);
-#else
-  return gpr_malloc_aligned(size, alignment);
-#endif
-}
-
-static void _aligned_free(void* ptr) {
-#if defined(GPR_LINUX)
-  free(ptr);
-#else
-  gpr_free_aligned(ptr);
-#endif
-}
-
 Arena::~Arena() {
   Zone* z = last_zone_;
   while (z) {
     Zone* prev_z = z->prev;
     z->~Zone();
-    _aligned_free(z);
+    gpr_free_aligned(z);
     z = prev_z;
   }
 }
@@ -75,15 +53,16 @@ Arena* Arena::Create(size_t initial_size) {
        GPR_CACHELINE_SIZE % GPR_MAX_ALIGNMENT == 0)
           ? GPR_CACHELINE_SIZE
           : GPR_MAX_ALIGNMENT;
-  void* storage = _aligned_alloc<alignment>(alloc_size);
-  GPR_ASSERT(storage != nullptr);
+  void* storage = (alignment == GPR_CACHELINE_SIZE)
+                      ? gpr_malloc_cacheline(alloc_size)
+                      : gpr_malloc_aligned(alloc_size, alignment);
   return new (storage) Arena(initial_size);
 }
 
 size_t Arena::Destroy() {
   size_t size = total_used_.Load(MemoryOrder::RELAXED);
   this->~Arena();
-  _aligned_free(this);
+  gpr_free_aligned(this);
   return size;
 }
 
@@ -96,8 +75,7 @@ void* Arena::AllocZone(size_t size) {
   static constexpr size_t zone_base_size =
       GPR_ROUND_UP_TO_ALIGNMENT_SIZE(sizeof(Zone));
   size_t alloc_size = zone_base_size + size;
-  void* storage = _aligned_alloc<GPR_MAX_ALIGNMENT>(alloc_size);
-  GPR_ASSERT(storage != nullptr);
+  void* storage = gpr_malloc_aligned(alloc_size, GPR_MAX_ALIGNMENT);
   Zone* z = new (storage) Zone();
   {
     gpr_spinlock_lock(&arena_growth_spinlock_);
