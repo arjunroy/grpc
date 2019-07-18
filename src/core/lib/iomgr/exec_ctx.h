@@ -48,6 +48,8 @@ typedef struct grpc_combiner grpc_combiner;
 /* This exec ctx was initialized by an internal thread, and should not
    be counted by fork handlers */
 #define GRPC_EXEC_CTX_FLAG_IS_INTERNAL_THREAD 4
+/* This exec ctx is currently in lazy-awaiting-init state */
+#define GRPC_EXEC_CTX_FLAG_IS_LAZY_INIT_WAITING 8
 
 /* This application callback exec ctx was initialized by an internal thread, and
    should not be counted by fork handlers */
@@ -210,7 +212,11 @@ class ExecCtx {
 
   /** Gets pointer to current exec_ctx. */
   static ExecCtx* Get() {
-    return reinterpret_cast<ExecCtx*>(gpr_tls_get(&exec_ctx_));
+    ExecCtx* ctx = reinterpret_cast<ExecCtx*>(gpr_tls_get(&exec_ctx_));
+    if (GPR_UNLIKELY(ctx->flags_ & GRPC_EXEC_CTX_FLAG_IS_LAZY_INIT_WAITING)) {
+      new (ctx) ExecCtx();
+    }
+    return ctx;
   }
 
   static void Set(ExecCtx* exec_ctx) {
@@ -226,6 +232,7 @@ class ExecCtx {
 
  private:
   /** Set exec_ctx_ to exec_ctx. */
+  friend class ExecCtxLazy;
 
   grpc_closure_list closure_list_ = GRPC_CLOSURE_LIST_INIT;
   CombinerData combiner_data_ = {nullptr, nullptr};
@@ -238,6 +245,24 @@ class ExecCtx {
 
   GPR_TLS_CLASS_DECL(exec_ctx_);
   ExecCtx* last_exec_ctx_ = Get();
+};
+
+class ExecCtxLazy {
+ public:
+  ExecCtxLazy() {
+    ExecCtx* ctx = reinterpret_cast<ExecCtx*>(ctx_);
+    ctx->flags_ = GRPC_EXEC_CTX_FLAG_IS_LAZY_INIT_WAITING;
+    ExecCtx::Set(ctx);
+  }
+  ~ExecCtxLazy() {
+    ExecCtx* ctx = reinterpret_cast<ExecCtx*>(ctx_);
+    if (!(ctx->flags_ & GRPC_EXEC_CTX_FLAG_IS_LAZY_INIT_WAITING)) {
+      ctx->~ExecCtx();
+    }
+  }
+
+ private:
+  char ctx_[sizeof(ExecCtx)];
 };
 
 /** Application-callback execution context.
